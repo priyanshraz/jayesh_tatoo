@@ -39,11 +39,22 @@ export async function POST(request) {
       data = { rawResponse: text, ok: response.ok };
     }
 
-    return Response.json(data, { status: response.status });
+    // If n8n itself returned an error status, wrap it in a 200 so the
+    // client's catch block handles it gracefully instead of throwing.
+    if (!response.ok) {
+      return Response.json(
+        { error: data?.error || `n8n returned ${response.status}`, rawResponse: text },
+        { status: 200 }
+      );
+    }
+
+    return Response.json(data, { status: 200 });
   } catch (err) {
+    // Network / parse errors — return 200 so the client can show a
+    // user-friendly message without crashing the dev overlay.
     return Response.json(
       { error: err.message || "Failed to reach n8n" },
-      { status: 500 }
+      { status: 200 }
     );
   }
 }

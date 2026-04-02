@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect, useCallback } from "react";
 import {
   Badge,
   Card,
@@ -11,6 +11,7 @@ import {
   Spinner,
   SecondaryButton,
 } from "./components";
+import { supabase } from "@/lib/supabase";
 
 // ─── CONSTANTS ───────────────────────────────────────────────
 const API_URL = "/api/trigger-n8n";
@@ -84,6 +85,155 @@ export default function Dashboard() {
   const [adCardStatuses,    setAdCardStatuses]     = useState({});
   const [schedulePickerOpen,setSchedulePickerOpen] = useState(null);
   const [scheduleDates,     setScheduleDates]      = useState({});
+
+  // ── Supabase reports state ──
+  const [sbRows, setSbRows] = useState([]);
+  const [sbLoading, setSbLoading] = useState(true);
+  const [sbTriggeringId, setSbTriggeringId] = useState(null);
+  const [sbToasts, setSbToasts] = useState([]);
+  const [sbExpandedInsights, setSbExpandedInsights] = useState({});
+  const [sbAdsConfigOpen, setSbAdsConfigOpen] = useState({});
+  const [sbAdsConfigs, setSbAdsConfigs] = useState({});
+  const [sbModalReport, setSbModalReport] = useState(null);
+  const [sbModalTab, setSbModalTab] = useState("competitors");
+  const [sbSortField, setSbSortField] = useState("score");
+  const [sbSortDir, setSbSortDir] = useState("desc");
+
+  const addSbToast = useCallback((message, type = "success") => {
+    const id = Date.now();
+    setSbToasts((prev) => [...prev, { id, message, type }]);
+    setTimeout(() => setSbToasts((prev) => prev.filter((t) => t.id !== id)), 3000);
+  }, []);
+
+  useEffect(() => {
+    async function fetchReports() {
+      const { data, error } = await supabase
+        .from("reports_json")
+        .select("*")
+        .order("created_at", { ascending: false });
+      if (error) {
+        console.error("Supabase error:", error);
+        addSbToast("Failed to fetch reports", "error");
+      }
+      setSbRows(data || []);
+      setSbLoading(false);
+    }
+    fetchReports();
+
+    // Realtime: auto-fetch new/updated/deleted rows
+    const channel = supabase
+      .channel("reports_json_realtime")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "reports_json" },
+        (payload) => {
+          if (payload.eventType === "INSERT") {
+            setSbRows((prev) => [payload.new, ...prev]);
+            addSbToast("New report received!");
+          } else if (payload.eventType === "UPDATE") {
+            setSbRows((prev) =>
+              prev.map((r) => (r.id === payload.new.id ? payload.new : r))
+            );
+          } else if (payload.eventType === "DELETE") {
+            setSbRows((prev) => prev.filter((r) => r.id !== payload.old.id));
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [addSbToast]);
+
+  function parseSbReport(row) {
+    let rd = row.report_data;
+    try {
+      if (typeof rd === "string") rd = JSON.parse(rd);
+      // Handle array-wrapped format: [{...}] → {...}
+      if (Array.isArray(rd)) rd = rd[0] || {};
+      return rd || {};
+    } catch { return {}; }
+  }
+
+  const sbReports = sbRows.map((row) => ({ row, report: parseSbReport(row) }));
+  const sbTotalReports = sbRows.length;
+  const sbTotalCompetitors = sbReports.reduce((s, { report }) => s + (report.competitors_table || []).length, 0);
+  const sbHighThreats = sbReports.reduce((s, { report }) => s + (report.competitors_table || []).filter((c) => c.threat === "high").length, 0);
+  const sbPendingAds = sbRows.filter((r) => !r.ads_workflow_triggered).length;
+
+  // ── Ads config helpers ──
+  const VIDEO_TYPES = ["Reel", "Story", "Feed Post", "Carousel"];
+  const DURATIONS = ["15 seconds", "30 seconds", "60 seconds", "90 seconds"];
+  const AUDIO_STYLES = ["Background Music", "Voiceover Only", "Music + Voiceover", "No Audio"];
+  const VIDEO_STYLES = ["Bold & Colorful", "Cinematic", "Minimal & Clean", "Dark & Moody", "Neon / Glow", "Hand-drawn / Sketch"];
+
+  function getAdsConfig(reportId) {
+    return sbAdsConfigs[reportId] || { numAds: 1, videos: [{ videoType: "Reel", duration: "15 seconds", audioStyle: "Background Music", videoStyle: "Bold & Colorful", videoIdea: "" }] };
+  }
+
+  function updateAdsConfig(reportId, updater) {
+    setSbAdsConfigs((prev) => {
+      const current = prev[reportId] || { numAds: 1, videos: [{ videoType: "Reel", duration: "15 seconds", audioStyle: "Background Music", videoStyle: "Bold & Colorful", videoIdea: "" }] };
+      return { ...prev, [reportId]: updater(current) };
+    });
+  }
+
+  function setNumAds(reportId, num) {
+    updateAdsConfig(reportId, (cfg) => {
+      const n = Math.max(1, Math.min(5, num));
+      const videos = [...cfg.videos];
+      while (videos.length < n) videos.push({ videoType: "Reel", duration: "15 seconds", audioStyle: "Background Music", videoStyle: "Bold & Colorful", videoIdea: "" });
+      return { ...cfg, numAds: n, videos: videos.slice(0, n) };
+    });
+  }
+
+  function updateVideoConfig(reportId, idx, field, value) {
+    updateAdsConfig(reportId, (cfg) => {
+      const videos = [...cfg.videos];
+      videos[idx] = { ...videos[idx], [field]: value };
+      return { ...cfg, videos };
+    });
+  }
+
+  async function handleTriggerAds(reportId, reportData) {
+    const config = getAdsConfig(reportId);
+    setSbTriggeringId(reportId);
+    try {
+      const res = await fetch("/api/trigger-ads", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ report_id: reportId, report_data: reportData, ads_config: config }),
+      });
+      const result = await res.json();
+      if (result.success) {
+        setSbRows((prev) => prev.map((r) => r.id === reportId ? { ...r, ads_workflow_triggered: true } : r));
+        addSbToast("Ads workflow triggered successfully!");
+      } else {
+        addSbToast("Failed to trigger. Try again.", "error");
+      }
+    } catch {
+      addSbToast("Failed to trigger. Try again.", "error");
+    }
+    setSbTriggeringId(null);
+  }
+
+  function formatSbDate(iso) {
+    const d = new Date(iso);
+    const day = String(d.getDate()).padStart(2, "0");
+    const mon = d.toLocaleString("en-US", { month: "short" }).toUpperCase();
+    return `${day} ${mon} ${d.getFullYear()}`;
+  }
+
+  function truncateSb(str, len = 200) {
+    if (!str) return "";
+    return str.length > len ? str.slice(0, len) + "..." : str;
+  }
+
+  function toggleSbSort(field) {
+    if (sbSortField === field) setSbSortDir((d) => (d === "desc" ? "asc" : "desc"));
+    else { setSbSortField(field); setSbSortDir("desc"); }
+  }
 
   // ── Reusable webhook caller ──
   async function callWebhook(payload, setStatus) {
@@ -2090,49 +2240,718 @@ export default function Dashboard() {
       )}
 
       {/* ═══════════════════════════════════════════════════════
-          REPORTS
+          REPORTS — Supabase Intelligence Dashboard
       ═══════════════════════════════════════════════════════ */}
       {tab === "reports" && (
         <div className="animate-fade-in">
-          <Card>
-            <EmptyState
-              title="No report available yet"
-              sub="n8n generates a report automatically every 2 weeks and delivers it here. First report after 14 days."
-            />
-            <div style={{ marginTop: 16 }}>
+          {/* Header row */}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+            <div>
+              <div style={{ fontSize: 16, fontWeight: 600, color: "var(--text)" }}>Competitor Ads Intelligence</div>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 4 }}>
+                <span style={{ width: 7, height: 7, borderRadius: "50%", background: "#22c55e", display: "inline-block", animation: "dotPulse 2s ease-in-out infinite" }} />
+                <span style={{ fontSize: 11, color: "var(--text-muted)" }}>Connected to Supabase</span>
+              </div>
+            </div>
+            <div>
               <button
                 onClick={generateReport}
                 disabled={reportStatus === "generating" || reportStatus === "waiting"}
                 style={{
-                  padding: "11px 18px",
+                  padding: "8px 16px",
                   borderRadius: "var(--radius-md)",
                   border: "none",
                   background: reportStatus === "done" ? "var(--green)" : reportStatus === "generating" || reportStatus === "waiting" ? "var(--surface)" : "var(--purple)",
                   color: reportStatus === "generating" || reportStatus === "waiting" ? "var(--purple)" : "#fff",
-                  fontSize: 13,
+                  fontSize: 12,
                   fontWeight: 500,
                   cursor: reportStatus === "generating" || reportStatus === "waiting" ? "not-allowed" : "pointer",
-                  opacity: reportStatus === "generating" || reportStatus === "waiting" ? 0.7 : 1,
                   fontFamily: "inherit",
                   display: "flex",
                   alignItems: "center",
-                  gap: 8,
+                  gap: 6,
                   transition: "background 0.2s",
                 }}
               >
                 {reportStatus === "generating" || reportStatus === "waiting"
-                  ? <><Spinner size={12} color="var(--purple)" /> Generating report...</>
+                  ? <><Spinner size={12} color="var(--purple)" /> Generating...</>
                   : reportStatus === "done"
-                  ? "✓ Report triggered — check your inbox"
-                  : "Manual report trigger — n8n webhook"}
+                  ? "✓ Report triggered"
+                  : "Manual report trigger"}
               </button>
-              {reportStatus === "error" && (
-                <div style={{ marginTop: 8, fontSize: 12, color: "var(--red-strong)" }}>
-                  Could not reach n8n: {webhookError}. Please try again.
-                </div>
-              )}
             </div>
-          </Card>
+          </div>
+
+          {/* Stats row */}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 12, marginBottom: 18 }}>
+            <MetricCard label="Total Reports" value={sbTotalReports} sub="From Supabase" color="var(--purple)" bg="var(--purple-light)" />
+            <MetricCard label="Competitors Tracked" value={sbTotalCompetitors} sub="All reports" color="var(--blue)" bg="var(--blue-light)" />
+            <MetricCard label="High Threats" value={sbHighThreats} sub="Needs attention" color="var(--red)" bg="var(--red-light)" dot={sbHighThreats > 0} />
+            <MetricCard label="Pending Ads" value={sbPendingAds} sub="Not yet triggered" color="var(--amber)" bg="var(--amber-light)" dot={sbPendingAds > 0} />
+          </div>
+
+          {/* Loading state */}
+          {sbLoading && (
+            <Card>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: 30 }}>
+                <Spinner size={16} />
+                <span style={{ fontSize: 13, color: "var(--text-muted)" }}>Loading reports from Supabase...</span>
+              </div>
+            </Card>
+          )}
+
+          {/* Empty state */}
+          {!sbLoading && sbReports.length === 0 && (
+            <Card>
+              <EmptyState
+                title="No reports yet"
+                sub="Run your n8n workflow to generate one. Reports will appear here automatically."
+              />
+            </Card>
+          )}
+
+          {/* Report cards */}
+          {!sbLoading && sbReports.map(({ row, report }) => {
+            const competitors = report.competitors_table || [];
+            const hooks = report.hooks_table || [];
+            const insights = report.market_insights_table || [];
+            const gaps = report.gaps_table || [];
+            const competitorCount = competitors.length;
+            const highCount = competitors.filter((c) => c.threat === "high").length;
+            const mediumCount = competitors.filter((c) => c.threat === "medium").length;
+            const gapsCount = gaps.length;
+            const triggered = row.ads_workflow_triggered;
+            const isTriggering = sbTriggeringId === row.id;
+            const insightsOpen = sbExpandedInsights[row.id];
+            const adsConfigOpen = sbAdsConfigOpen[row.id];
+            const adsConfig = getAdsConfig(row.id);
+
+            return (
+              <Card key={row.id} style={{ marginBottom: 14 }}>
+                {/* Top row: date + status */}
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+                  <span style={{ fontSize: 12, color: "var(--text-muted)", fontFamily: "monospace" }}>
+                    {formatSbDate(row.created_at)}
+                  </span>
+                  <Badge
+                    text={triggered ? "Ads Created" : "Pending"}
+                    color={triggered ? "var(--green)" : "var(--text-muted)"}
+                    bg={triggered ? "var(--green-light)" : "var(--surface)"}
+                  />
+                </div>
+
+                {/* Executive summary */}
+                <p style={{ fontSize: 13, color: "var(--text-body)", lineHeight: 1.7, marginBottom: 14 }}>
+                  {report.executive_summary || "No summary available."}
+                </p>
+
+                {/* Tags */}
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 16 }}>
+                  <Badge text={`${competitorCount} competitors`} color="var(--blue)" bg="var(--blue-light)" />
+                  {highCount > 0 && <Badge text={`${highCount} high threat`} color="var(--red)" bg="var(--red-light)" />}
+                  {mediumCount > 0 && <Badge text={`${mediumCount} medium threat`} color="var(--amber)" bg="var(--amber-light)" />}
+                  <Badge text={`${hooks.length} hooks`} color="var(--purple)" bg="var(--purple-light)" />
+                  <Badge text={`${gapsCount} gaps`} color="var(--amber)" bg="var(--amber-light)" />
+                </div>
+
+                {/* ── INLINE: Top Competitors (always visible) ── */}
+                {competitors.length > 0 && (
+                  <div style={{ marginBottom: 14 }}>
+                    <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 8 }}>
+                      Top Competitors
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                      {competitors.slice(0, 5).map((c, i) => (
+                        <div key={i} style={{
+                          display: "flex", alignItems: "center", justifyContent: "space-between",
+                          padding: "8px 12px", borderRadius: "var(--radius-sm)",
+                          background: "var(--surface)", border: "0.5px solid var(--border-light)",
+                        }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 10, flex: 1, minWidth: 0 }}>
+                            <span style={{ fontSize: 11, color: "var(--text-dim)", fontWeight: 600, width: 18 }}>{i + 1}</span>
+                            <span style={{ fontSize: 12, fontWeight: 500, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.name}</span>
+                          </div>
+                          <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+                            <span style={{ fontSize: 11, color: "var(--text-muted)" }}>{c.ads} ads</span>
+                            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                              <div style={{ width: 40, height: 4, borderRadius: 2, background: "var(--border)", overflow: "hidden" }}>
+                                <div style={{
+                                  height: "100%", borderRadius: 2,
+                                  width: `${((c.score || 0) / 12) * 100}%`,
+                                  background: c.score >= 9 ? "var(--red-error)" : c.score >= 6 ? "var(--amber)" : "var(--green)",
+                                }} />
+                              </div>
+                              <span style={{ fontSize: 10, color: "var(--text-muted)" }}>{c.score}/12</span>
+                            </div>
+                            <Badge
+                              text={c.threat}
+                              color={c.threat === "high" ? "var(--red)" : c.threat === "medium" ? "var(--amber)" : "var(--green)"}
+                              bg={c.threat === "high" ? "var(--red-light)" : c.threat === "medium" ? "var(--amber-light)" : "var(--green-light)"}
+                            />
+                          </div>
+                        </div>
+                      ))}
+                      {competitors.length > 5 && (
+                        <div style={{ fontSize: 11, color: "var(--text-dim)", textAlign: "center", padding: 4 }}>
+                          +{competitors.length - 5} more — click &ldquo;View Full Report&rdquo; to see all
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* ── INLINE: Top Hooks (always visible) ── */}
+                {hooks.length > 0 && (
+                  <div style={{ marginBottom: 14 }}>
+                    <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 8 }}>
+                      Top Hooks
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                      {hooks.slice(0, 4).map((h, i) => (
+                        <div key={i} style={{
+                          padding: "10px 12px", borderRadius: "var(--radius-sm)",
+                          background: "var(--surface)", border: "0.5px solid var(--border-light)",
+                        }}>
+                          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+                            <span style={{ fontSize: 12, fontWeight: 600, color: "var(--text)" }}>{h.pattern}</span>
+                            <Badge
+                              text={h.score}
+                              color={(h.score || "").toLowerCase() === "strong" ? "var(--green)" : (h.score || "").toLowerCase() === "moderate" ? "var(--amber)" : "var(--text-muted)"}
+                              bg={(h.score || "").toLowerCase() === "strong" ? "var(--green-light)" : (h.score || "").toLowerCase() === "moderate" ? "var(--amber-light)" : "var(--surface)"}
+                            />
+                          </div>
+                          <p style={{ fontSize: 11, fontStyle: "italic", color: "var(--amber)", lineHeight: 1.5 }}>
+                            &ldquo;{h.example}&rdquo;
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* ── INLINE: Top Gaps (always visible) ── */}
+                {gaps.length > 0 && (
+                  <div style={{ marginBottom: 14 }}>
+                    <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 8 }}>
+                      Gaps & Opportunities
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                      {[...gaps].sort((a, b) => {
+                        const order = { high: 0, medium: 1, low: 2 };
+                        return (order[a.priority] ?? 3) - (order[b.priority] ?? 3);
+                      }).slice(0, 3).map((g, i) => (
+                        <div key={i} style={{
+                          padding: "10px 12px", borderRadius: "var(--radius-sm)",
+                          background: "var(--surface)", border: "0.5px solid var(--border-light)",
+                        }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                            <Badge
+                              text={g.priority?.toUpperCase()}
+                              color={g.priority === "high" ? "var(--red)" : g.priority === "medium" ? "var(--amber)" : "var(--green)"}
+                              bg={g.priority === "high" ? "var(--red-light)" : g.priority === "medium" ? "var(--amber-light)" : "var(--green-light)"}
+                            />
+                            <span style={{ fontSize: 12, fontWeight: 600, color: "var(--text)" }}>{g.gap}</span>
+                          </div>
+                          <div style={{ display: "flex", alignItems: "flex-start", gap: 5, paddingLeft: 2 }}>
+                            <span style={{ fontSize: 11 }}>💡</span>
+                            <p style={{ fontSize: 11, color: "var(--text-body)", lineHeight: 1.5 }}>{g.opportunity}</p>
+                          </div>
+                        </div>
+                      ))}
+                      {gaps.length > 3 && (
+                        <div style={{ fontSize: 11, color: "var(--text-dim)", textAlign: "center", padding: 4 }}>
+                          +{gaps.length - 3} more gaps — click &ldquo;View Full Report&rdquo; to see all
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Action buttons */}
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                  <SecondaryButton
+                    onClick={() => setSbExpandedInsights((prev) => ({ ...prev, [row.id]: !prev[row.id] }))}
+                  >
+                    {insightsOpen ? "Hide Insights" : "View Insights"}
+                  </SecondaryButton>
+                  <SecondaryButton
+                    onClick={() => { setSbModalReport({ row, report }); setSbModalTab("competitors"); }}
+                  >
+                    View Full Report
+                  </SecondaryButton>
+                  {triggered ? (
+                    <span style={{
+                      padding: "7px 14px", borderRadius: "var(--radius-md)", fontSize: 12, fontWeight: 500,
+                      background: "var(--green-light)", color: "var(--green)", display: "inline-flex", alignItems: "center", gap: 4,
+                    }}>
+                      Ads Triggered ✓
+                    </span>
+                  ) : (
+                    <button
+                      onClick={() => setSbAdsConfigOpen((prev) => ({ ...prev, [row.id]: !prev[row.id] }))}
+                      style={{
+                        padding: "7px 16px", borderRadius: "var(--radius-md)", border: "none",
+                        background: "linear-gradient(135deg, #f97316, #ec4899)", color: "#fff",
+                        fontSize: 12, fontWeight: 600, cursor: "pointer",
+                        fontFamily: "inherit", display: "inline-flex", alignItems: "center", gap: 6,
+                        transition: "opacity 0.2s, transform 0.15s",
+                      }}
+                      onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.transform = "translateY(0)"; }}
+                    >
+                      {adsConfigOpen ? "Cancel" : "Generate Ads →"}
+                    </button>
+                  )}
+                </div>
+
+                {/* ── Video Configuration Panel ── */}
+                {adsConfigOpen && !triggered && (
+                  <div className="animate-slide-down" style={{
+                    marginTop: 14, padding: 18, borderRadius: "var(--radius-md)",
+                    background: "var(--surface)", border: "0.5px solid var(--border-light)",
+                  }}>
+                    {/* Number of Ads */}
+                    <div style={{ marginBottom: 16 }}>
+                      <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 6 }}>
+                        Number of Ads to Generate
+                      </div>
+                      <input
+                        type="number"
+                        min={1}
+                        max={5}
+                        value={adsConfig.numAds}
+                        onChange={(e) => setNumAds(row.id, parseInt(e.target.value) || 1)}
+                        style={{
+                          width: 70, padding: "8px 10px", borderRadius: "var(--radius-sm)",
+                          border: "1px solid var(--border)", background: "var(--card-bg)",
+                          color: "var(--text)", fontSize: 13, fontFamily: "inherit", fontWeight: 500,
+                          outline: "none", transition: "border-color 0.15s",
+                        }}
+                        onFocus={(e) => { e.currentTarget.style.borderColor = "var(--purple)"; }}
+                        onBlur={(e) => { e.currentTarget.style.borderColor = "var(--border)"; }}
+                      />
+                    </div>
+
+                    {/* Video configs */}
+                    {adsConfig.videos.map((video, vIdx) => (
+                      <div key={vIdx} style={{
+                        padding: 16, borderRadius: "var(--radius-md)", marginBottom: 12,
+                        background: "var(--card-bg)", border: "0.5px solid var(--border)",
+                      }}>
+                        <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)", marginBottom: 14, display: "flex", alignItems: "center", gap: 6 }}>
+                          <span style={{ fontSize: 15 }}>🎬</span> Video {vIdx + 1} Configuration
+                        </div>
+
+                        {/* Row 1: Video Type + Duration */}
+                        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
+                          <div>
+                            <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 6 }}>
+                              Video Type
+                            </div>
+                            <select
+                              value={video.videoType}
+                              onChange={(e) => updateVideoConfig(row.id, vIdx, "videoType", e.target.value)}
+                              style={{
+                                width: "100%", padding: "9px 10px", borderRadius: "var(--radius-sm)",
+                                border: "1px solid var(--border)", background: "var(--card-bg)",
+                                color: "var(--text)", fontSize: 12, fontFamily: "inherit",
+                                outline: "none", cursor: "pointer", appearance: "auto",
+                              }}
+                            >
+                              {VIDEO_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+                            </select>
+                          </div>
+                          <div>
+                            <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 6 }}>
+                              Duration
+                            </div>
+                            <select
+                              value={video.duration}
+                              onChange={(e) => updateVideoConfig(row.id, vIdx, "duration", e.target.value)}
+                              style={{
+                                width: "100%", padding: "9px 10px", borderRadius: "var(--radius-sm)",
+                                border: "1px solid var(--border)", background: "var(--card-bg)",
+                                color: "var(--text)", fontSize: 12, fontFamily: "inherit",
+                                outline: "none", cursor: "pointer", appearance: "auto",
+                              }}
+                            >
+                              {DURATIONS.map((d) => <option key={d} value={d}>{d}</option>)}
+                            </select>
+                          </div>
+                        </div>
+
+                        {/* Row 2: Audio Style + Video Style */}
+                        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
+                          <div>
+                            <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 6 }}>
+                              Audio Style
+                            </div>
+                            <select
+                              value={video.audioStyle}
+                              onChange={(e) => updateVideoConfig(row.id, vIdx, "audioStyle", e.target.value)}
+                              style={{
+                                width: "100%", padding: "9px 10px", borderRadius: "var(--radius-sm)",
+                                border: "1px solid var(--border)", background: "var(--card-bg)",
+                                color: "var(--text)", fontSize: 12, fontFamily: "inherit",
+                                outline: "none", cursor: "pointer", appearance: "auto",
+                              }}
+                            >
+                              {AUDIO_STYLES.map((a) => <option key={a} value={a}>{a}</option>)}
+                            </select>
+                          </div>
+                          <div>
+                            <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 6 }}>
+                              Video Style
+                            </div>
+                            <select
+                              value={video.videoStyle}
+                              onChange={(e) => updateVideoConfig(row.id, vIdx, "videoStyle", e.target.value)}
+                              style={{
+                                width: "100%", padding: "9px 10px", borderRadius: "var(--radius-sm)",
+                                border: "1px solid var(--border)", background: "var(--card-bg)",
+                                color: "var(--text)", fontSize: 12, fontFamily: "inherit",
+                                outline: "none", cursor: "pointer", appearance: "auto",
+                              }}
+                            >
+                              {VIDEO_STYLES.map((v) => <option key={v} value={v}>{v}</option>)}
+                            </select>
+                          </div>
+                        </div>
+
+                        {/* Video Idea */}
+                        <div>
+                          <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 6 }}>
+                            Video Idea
+                          </div>
+                          <textarea
+                            placeholder="e.g. generate a video with offer and sales ads, customer review and about service..."
+                            value={video.videoIdea}
+                            onChange={(e) => updateVideoConfig(row.id, vIdx, "videoIdea", e.target.value)}
+                            style={{
+                              width: "100%", minHeight: 60, padding: "10px 12px",
+                              borderRadius: "var(--radius-sm)", border: "1px solid var(--border)",
+                              background: "var(--card-bg)", color: "var(--text)", fontSize: 12,
+                              fontFamily: "inherit", lineHeight: 1.6, resize: "vertical",
+                              outline: "none", transition: "border-color 0.15s",
+                            }}
+                            onFocus={(e) => { e.currentTarget.style.borderColor = "var(--purple)"; }}
+                            onBlur={(e) => { e.currentTarget.style.borderColor = "var(--border)"; }}
+                          />
+                        </div>
+                      </div>
+                    ))}
+
+                    {/* Submit */}
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 4 }}>
+                      <span style={{ fontSize: 11, color: "var(--text-dim)" }}>
+                        {adsConfig.numAds} video{adsConfig.numAds > 1 ? "s" : ""} configured — report data + config will be sent to the ads workflow
+                      </span>
+                      <button
+                        onClick={() => handleTriggerAds(row.id, report)}
+                        disabled={isTriggering}
+                        style={{
+                          padding: "9px 22px", borderRadius: "var(--radius-md)", border: "none",
+                          background: "linear-gradient(135deg, #f97316, #ec4899)", color: "#fff",
+                          fontSize: 12, fontWeight: 600, cursor: isTriggering ? "not-allowed" : "pointer",
+                          fontFamily: "inherit", display: "inline-flex", alignItems: "center", gap: 6,
+                          opacity: isTriggering ? 0.7 : 1, transition: "opacity 0.2s, transform 0.15s",
+                        }}
+                        onMouseEnter={(e) => { if (!isTriggering) e.currentTarget.style.transform = "translateY(-1px)"; }}
+                        onMouseLeave={(e) => { e.currentTarget.style.transform = "translateY(0)"; }}
+                      >
+                        {isTriggering ? <><Spinner size={12} /> Triggering...</> : "Confirm & Generate Ads →"}
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Market Insights Panel (toggled) */}
+                {insightsOpen && insights.length > 0 && (
+                  <div className="animate-slide-down" style={{
+                    marginTop: 14, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10,
+                    background: "var(--surface)", borderRadius: "var(--radius-md)", padding: 14,
+                  }}>
+                    {insights.map((ins, i) => {
+                      const f = (ins.field || "").toLowerCase();
+                      const icon = f.includes("format") ? "🎬" : f.includes("angle") ? "🎯" : f.includes("framework") ? "📐" : f.includes("cta") ? "👆" : "📋";
+                      return (
+                        <div key={i} style={{ padding: "10px 12px", background: "var(--card-bg)", borderRadius: "var(--radius-sm)", border: "0.5px solid var(--border-light)" }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+                            <span style={{ fontSize: 14 }}>{icon}</span>
+                            <div style={{ fontSize: 10, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.04em" }}>
+                              {ins.field}
+                            </div>
+                          </div>
+                          <div style={{ fontSize: 13, color: "var(--text)", fontWeight: 500, lineHeight: 1.5 }}>{ins.value}</div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </Card>
+            );
+          })}
+
+          {/* ── FULL REPORT MODAL ── */}
+          {sbModalReport && (() => {
+            const { report } = sbModalReport;
+            const competitors = [...(report.competitors_table || [])].sort((a, b) => {
+              const av = a[sbSortField], bv = b[sbSortField];
+              if (typeof av === "number") return sbSortDir === "desc" ? bv - av : av - bv;
+              return sbSortDir === "desc" ? String(bv).localeCompare(String(av)) : String(av).localeCompare(String(bv));
+            });
+            const gaps = [...(report.gaps_table || [])].sort((a, b) => {
+              const order = { high: 0, medium: 1, low: 2 };
+              return (order[a.priority] ?? 3) - (order[b.priority] ?? 3);
+            });
+            const modalTabs = [
+              { id: "competitors", label: "Competitors" },
+              { id: "hooks", label: "Hooks" },
+              { id: "insights", label: "Market Insights" },
+              { id: "gaps", label: "Gaps" },
+            ];
+
+            return (
+              <div
+                onClick={() => setSbModalReport(null)}
+                style={{
+                  position: "fixed", inset: 0, zIndex: 1000,
+                  background: "rgba(0,0,0,0.5)", backdropFilter: "blur(4px)",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  padding: 20, animation: "fadeIn 0.2s ease-out",
+                }}
+              >
+                <div
+                  onClick={(e) => e.stopPropagation()}
+                  className="animate-scale-in"
+                  style={{
+                    width: "100%", maxWidth: 820, maxHeight: "85vh",
+                    background: "var(--card-bg)", border: "0.5px solid var(--border)",
+                    borderRadius: "var(--radius-lg)", boxShadow: "var(--shadow-lg)",
+                    display: "flex", flexDirection: "column", overflow: "hidden",
+                  }}
+                >
+                  {/* Modal header */}
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "16px 20px", borderBottom: "0.5px solid var(--border)" }}>
+                    <div style={{ fontSize: 15, fontWeight: 600 }}>Full Report</div>
+                    <button
+                      onClick={() => setSbModalReport(null)}
+                      style={{
+                        width: 28, height: 28, borderRadius: "var(--radius-sm)", border: "1px solid var(--border)",
+                        background: "var(--surface)", cursor: "pointer", display: "flex", alignItems: "center",
+                        justifyContent: "center", fontSize: 14, color: "var(--text-muted)", fontFamily: "inherit",
+                        transition: "background 0.15s",
+                      }}
+                      onMouseEnter={(e) => { e.currentTarget.style.background = "var(--surface-hover)"; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.background = "var(--surface)"; }}
+                    >
+                      ✕
+                    </button>
+                  </div>
+
+                  {/* Modal tabs */}
+                  <div style={{ display: "flex", gap: 4, padding: "12px 20px 0", borderBottom: "0.5px solid var(--border)" }}>
+                    {modalTabs.map((mt) => (
+                      <button
+                        key={mt.id}
+                        onClick={() => setSbModalTab(mt.id)}
+                        style={{
+                          padding: "8px 14px", fontSize: 12, fontWeight: sbModalTab === mt.id ? 600 : 400,
+                          borderRadius: "var(--radius-sm) var(--radius-sm) 0 0",
+                          border: "none", cursor: "pointer", fontFamily: "inherit",
+                          background: sbModalTab === mt.id ? "var(--purple-light)" : "transparent",
+                          color: sbModalTab === mt.id ? "var(--purple)" : "var(--text-muted)",
+                          transition: "all 0.15s",
+                        }}
+                      >
+                        {mt.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Modal content */}
+                  <div style={{ flex: 1, overflow: "auto", padding: 20 }}>
+
+                    {/* TAB: Competitors */}
+                    {sbModalTab === "competitors" && (
+                      <div style={{ overflowX: "auto" }}>
+                        <table style={{ width: "100%", fontSize: 12, borderCollapse: "collapse" }}>
+                          <thead>
+                            <tr style={{ textAlign: "left", fontSize: 10, textTransform: "uppercase", letterSpacing: "0.04em", color: "var(--text-muted)" }}>
+                              <th style={{ padding: "8px 10px" }}>#</th>
+                              <th style={{ padding: "8px 10px", cursor: "pointer" }} onClick={() => toggleSbSort("name")}>
+                                Name {sbSortField === "name" && (sbSortDir === "desc" ? "↓" : "↑")}
+                              </th>
+                              <th style={{ padding: "8px 10px", cursor: "pointer" }} onClick={() => toggleSbSort("ads")}>
+                                Ads {sbSortField === "ads" && (sbSortDir === "desc" ? "↓" : "↑")}
+                              </th>
+                              <th style={{ padding: "8px 10px", cursor: "pointer" }} onClick={() => toggleSbSort("score")}>
+                                Score {sbSortField === "score" && (sbSortDir === "desc" ? "↓" : "↑")}
+                              </th>
+                              <th style={{ padding: "8px 10px" }}>Threat</th>
+                              <th style={{ padding: "8px 10px" }}>Angle</th>
+                              <th style={{ padding: "8px 10px" }}>Hook</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {competitors.map((c, i) => (
+                              <tr key={i} style={{ borderTop: "0.5px solid var(--border-light)", background: i % 2 === 0 ? "transparent" : "var(--surface)" }}>
+                                <td style={{ padding: "10px", color: "var(--text-muted)" }}>{i + 1}</td>
+                                <td style={{ padding: "10px", fontWeight: 500 }}>{c.name}</td>
+                                <td style={{ padding: "10px", color: "var(--text-body)" }}>{c.ads}</td>
+                                <td style={{ padding: "10px" }}>
+                                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                                    <div style={{ width: 50, height: 5, borderRadius: 3, background: "var(--border)", overflow: "hidden" }}>
+                                      <div style={{
+                                        height: "100%", borderRadius: 3,
+                                        width: `${((c.score || 0) / 12) * 100}%`,
+                                        background: c.score >= 9 ? "var(--red-error)" : c.score >= 6 ? "var(--amber)" : "var(--green)",
+                                      }} />
+                                    </div>
+                                    <span style={{ fontSize: 11, color: "var(--text-muted)" }}>{c.score}/12</span>
+                                  </div>
+                                </td>
+                                <td style={{ padding: "10px" }}>
+                                  <Badge
+                                    text={c.threat}
+                                    color={c.threat === "high" ? "var(--red)" : c.threat === "medium" ? "var(--amber)" : "var(--green)"}
+                                    bg={c.threat === "high" ? "var(--red-light)" : c.threat === "medium" ? "var(--amber-light)" : "var(--green-light)"}
+                                  />
+                                </td>
+                                <td style={{ padding: "10px", fontSize: 11, color: "var(--text-body)" }}>{c.angle}</td>
+                                <td style={{ padding: "10px", fontSize: 11, color: "var(--text-muted)", fontStyle: "italic" }}>{c.hook}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                        {competitors.length === 0 && (
+                          <div style={{ textAlign: "center", padding: 30, color: "var(--text-muted)", fontSize: 13 }}>No competitors data</div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* TAB: Hooks */}
+                    {sbModalTab === "hooks" && (
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                        {(report.hooks_table || []).map((h, i) => (
+                          <div key={i} style={{
+                            padding: 16, borderRadius: "var(--radius-md)", background: "var(--surface)",
+                            border: "0.5px solid var(--border-light)", transition: "box-shadow 0.15s",
+                          }}>
+                            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                              <span style={{ fontSize: 13, fontWeight: 600, color: "var(--text)" }}>{h.pattern}</span>
+                              <Badge
+                                text={h.score}
+                                color={
+                                  (h.score || "").toLowerCase() === "strong" ? "var(--green)" :
+                                  (h.score || "").toLowerCase() === "moderate" ? "var(--amber)" : "var(--text-muted)"
+                                }
+                                bg={
+                                  (h.score || "").toLowerCase() === "strong" ? "var(--green-light)" :
+                                  (h.score || "").toLowerCase() === "moderate" ? "var(--amber-light)" : "var(--surface)"
+                                }
+                              />
+                            </div>
+                            <p style={{ fontSize: 12, fontStyle: "italic", color: "var(--amber)", marginBottom: 6, lineHeight: 1.5 }}>
+                              &ldquo;{h.example}&rdquo;
+                            </p>
+                            <p style={{ fontSize: 11, color: "var(--text-muted)", lineHeight: 1.5 }}>{h.reason}</p>
+                          </div>
+                        ))}
+                        {(!report.hooks_table || report.hooks_table.length === 0) && (
+                          <div style={{ gridColumn: "1 / -1", textAlign: "center", padding: 30, color: "var(--text-muted)", fontSize: 13 }}>No hooks data</div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* TAB: Market Insights */}
+                    {sbModalTab === "insights" && (
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                        {(report.market_insights_table || []).map((ins, i) => {
+                          const f = (ins.field || "").toLowerCase();
+                          const icon = f.includes("format") ? "🎬" : f.includes("angle") ? "🎯" : f.includes("framework") ? "📐" : f.includes("cta") ? "👆" : "📋";
+                          return (
+                            <div key={i} style={{
+                              padding: 18, borderRadius: "var(--radius-md)", background: "var(--surface)",
+                              border: "0.5px solid var(--border-light)",
+                            }}>
+                              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                                <span style={{ fontSize: 18 }}>{icon}</span>
+                                <span style={{ fontSize: 13, fontWeight: 600, color: "var(--text)" }}>{ins.field}</span>
+                              </div>
+                              <p style={{ fontSize: 12, color: "var(--text-body)", lineHeight: 1.6 }}>{ins.value}</p>
+                            </div>
+                          );
+                        })}
+                        {(!report.market_insights_table || report.market_insights_table.length === 0) && (
+                          <div style={{ gridColumn: "1 / -1", textAlign: "center", padding: 30, color: "var(--text-muted)", fontSize: 13 }}>No market insights data</div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* TAB: Gaps & Opportunities */}
+                    {sbModalTab === "gaps" && (
+                      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                        {gaps.map((g, i) => (
+                          <div key={i} style={{
+                            padding: 16, borderRadius: "var(--radius-md)", background: "var(--surface)",
+                            border: "0.5px solid var(--border-light)",
+                          }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                              <Badge
+                                text={g.priority?.toUpperCase()}
+                                color={g.priority === "high" ? "var(--red)" : g.priority === "medium" ? "var(--amber)" : "var(--green)"}
+                                bg={g.priority === "high" ? "var(--red-light)" : g.priority === "medium" ? "var(--amber-light)" : "var(--green-light)"}
+                              />
+                              <span style={{ fontSize: 13, fontWeight: 600, color: "var(--text)" }}>{g.gap}</span>
+                            </div>
+                            <div style={{ display: "flex", alignItems: "flex-start", gap: 6, marginBottom: 6, paddingLeft: 2 }}>
+                              <span style={{ fontSize: 13 }}>💡</span>
+                              <p style={{ fontSize: 12, color: "var(--text-body)", lineHeight: 1.5 }}>{g.opportunity}</p>
+                            </div>
+                            <div style={{ display: "flex", alignItems: "flex-start", gap: 6, paddingLeft: 2 }}>
+                              <span style={{ fontSize: 13 }}>📈</span>
+                              <p style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.5 }}>{g.impact}</p>
+                            </div>
+                          </div>
+                        ))}
+                        {gaps.length === 0 && (
+                          <div style={{ textAlign: "center", padding: 30, color: "var(--text-muted)", fontSize: 13 }}>No gaps data</div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
+
+          {/* Toast notifications */}
+          {sbToasts.length > 0 && (
+            <div style={{ position: "fixed", bottom: 20, right: 20, zIndex: 1100, display: "flex", flexDirection: "column", gap: 8 }}>
+              {sbToasts.map((t) => (
+                <div
+                  key={t.id}
+                  className="animate-slide-up"
+                  onClick={() => setSbToasts((prev) => prev.filter((x) => x.id !== t.id))}
+                  style={{
+                    padding: "10px 16px", borderRadius: "var(--radius-md)",
+                    background: t.type === "success" ? "var(--green)" : "var(--red-error)",
+                    color: "#fff", fontSize: 12, fontWeight: 500, cursor: "pointer",
+                    boxShadow: "var(--shadow-md)",
+                  }}
+                >
+                  {t.message}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {reportStatus === "error" && (
+            <div style={{ marginTop: 8, fontSize: 12, color: "var(--red-strong)" }}>
+              Could not reach n8n: {webhookError}. Please try again.
+            </div>
+          )}
         </div>
       )}
     </div>
