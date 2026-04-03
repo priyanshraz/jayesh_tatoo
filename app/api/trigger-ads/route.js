@@ -26,7 +26,7 @@ export async function POST(request) {
 
     // Call external webhook with full report data
     try {
-      await fetch('https://webhook-placeholder.com/trigger-ads', {
+      await fetch('https://n8n.srv881198.hstgr.cloud/webhook/generate_ad', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ report_id, report_data, ads_config: ads_config || {} }),
