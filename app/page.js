@@ -100,19 +100,30 @@ export default function Dashboard() {
   const [sbSortDir, setSbSortDir] = useState("desc");
 
   // ── Ad preview videos state ──
-  const AD_BUCKETS = [
+  const SUPABASE_URL = "https://nidoqmcxmlyiovdktzxg.supabase.co";
+  const AD_BUCKET_DEFS = [
     { bucket: "AD1", label: "Ad 1", file: "data1.mp4" },
     { bucket: "AD2", label: "Ad 2", file: "data2.mp4" },
     { bucket: "AD3", label: "Ad 3", file: "data3.mp4" },
   ];
-  const [adVideoCacheBust, setAdVideoCacheBust] = useState(() => Date.now());
+  const [adVideos, setAdVideos] = useState(AD_BUCKET_DEFS.map((d) => ({ ...d, available: false })));
   const [adVideosRefreshing, setAdVideosRefreshing] = useState(false);
 
   const fetchAdVideos = useCallback(async () => {
     setAdVideosRefreshing(true);
-    // Small delay so the spinner is visible
-    await new Promise((r) => setTimeout(r, 500));
-    setAdVideoCacheBust(Date.now());
+    const ts = Date.now();
+    const results = await Promise.all(
+      AD_BUCKET_DEFS.map(async ({ bucket, label, file }) => {
+        const url = `${SUPABASE_URL}/storage/v1/object/public/${bucket}/${file}?t=${ts}`;
+        try {
+          const res = await fetch(url, { method: "HEAD" });
+          return { bucket, label, file, available: res.ok, ts };
+        } catch {
+          return { bucket, label, file, available: false, ts };
+        }
+      })
+    );
+    setAdVideos(results);
     setAdVideosRefreshing(false);
   }, []);
 
@@ -1722,7 +1733,7 @@ export default function Dashboard() {
                 gap: 16,
               }}
             >
-              {AD_BUCKETS.map((ad) => (
+              {adVideos.map((ad) => (
                 <Card key={ad.bucket} style={{ padding: 12 }}>
                   <div
                     style={{
@@ -1747,13 +1758,19 @@ export default function Dashboard() {
                       overflow: "hidden",
                     }}
                   >
-                    <video
-                      key={adVideoCacheBust}
-                      src={`https://nidoqmcxmlyiovdktzxg.supabase.co/storage/v1/object/public/${ad.bucket}/${ad.file}?t=${adVideoCacheBust}`}
-                      controls
-                      autoPlay={false}
-                      style={{ width: "100%", height: "100%", objectFit: "cover" }}
-                    />
+                    {ad.available ? (
+                      <video
+                        key={ad.ts}
+                        src={`${SUPABASE_URL}/storage/v1/object/public/${ad.bucket}/${ad.file}?t=${ad.ts}`}
+                        controls
+                        autoPlay={false}
+                        style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                      />
+                    ) : (
+                      <span style={{ fontSize: 12, color: "var(--text-muted)" }}>
+                        {adVideosRefreshing ? "Checking…" : "No video yet"}
+                      </span>
+                    )}
                   </div>
                 </Card>
               ))}
