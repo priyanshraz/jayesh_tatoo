@@ -120,6 +120,18 @@ export default function Dashboard() {
     }
     fetchReports();
 
+    // Load persisted analysis data
+    const savedAnalysis = localStorage.getItem("lastAnalysisData");
+    if (savedAnalysis) {
+      try {
+        const parsed = JSON.parse(savedAnalysis);
+        setAnalysisData(parsed);
+        setAnalysisStatus("done");
+      } catch (e) {
+        console.error("Failed to parse saved analysis:", e);
+      }
+    }
+
     // Realtime: auto-fetch new/updated/deleted rows
     const channel = supabase
       .channel("reports_json_realtime")
@@ -274,6 +286,7 @@ export default function Dashboard() {
     if (result) {
       console.log("n8n analysis response:", result);
       setAnalysisData(result);
+      localStorage.setItem("lastAnalysisData", JSON.stringify(result));
       setAnalysisStatus("done");
     } else if (analysisStatus !== "error") {
       setAnalysisStatus("waiting");
@@ -1654,6 +1667,57 @@ export default function Dashboard() {
               </button>
             </Card>
           )}
+
+          {/* ── AD PREVIEWS ── */}
+          <div style={{ marginTop: 24 }}>
+            <SectionTitle>Ad Previews</SectionTitle>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))",
+                gap: 16,
+              }}
+            >
+              {[
+                { id: "AD1", label: "Ad 1", file: "data1.mp4" },
+                { id: "AD2", label: "Ad 2", file: "data2.mp4" },
+                { id: "AD3", label: "Ad 3", file: "data3.mp4" },
+              ].map((ad) => (
+                <Card key={ad.id} style={{ padding: 12 }}>
+                  <div
+                    style={{
+                      fontSize: 12,
+                      fontWeight: 600,
+                      color: "var(--text-muted)",
+                      marginBottom: 10,
+                      textTransform: "uppercase",
+                      letterSpacing: "0.04em",
+                    }}
+                  >
+                    {ad.label}
+                  </div>
+                  <div
+                    style={{
+                      background: "var(--surface)",
+                      borderRadius: "var(--radius-md)",
+                      aspectRatio: "9/16",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      overflow: "hidden",
+                    }}
+                  >
+                    <video
+                      src={`https://nidoqmcxmlyiovdktzxg.supabase.co/storage/v1/object/public/${ad.id}/${ad.file}`}
+                      controls
+                      autoPlay={false}
+                      style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                    />
+                  </div>
+                </Card>
+              ))}
+            </div>
+          </div>
         </div>
       )}
 
