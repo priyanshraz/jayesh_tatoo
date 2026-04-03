@@ -99,6 +99,30 @@ export default function Dashboard() {
   const [sbSortField, setSbSortField] = useState("score");
   const [sbSortDir, setSbSortDir] = useState("desc");
 
+  // ── Ad preview videos state ──
+  const [adVideos, setAdVideos] = useState([
+    { bucket: "AD1", label: "Ad 1", file: null },
+    { bucket: "AD2", label: "Ad 2", file: null },
+    { bucket: "AD3", label: "Ad 3", file: null },
+  ]);
+  const [adVideosRefreshing, setAdVideosRefreshing] = useState(false);
+
+  const fetchAdVideos = useCallback(async () => {
+    setAdVideosRefreshing(true);
+    const buckets = ["AD1", "AD2", "AD3"];
+    const results = await Promise.all(
+      buckets.map(async (bucket) => {
+        const { data, error } = await supabase.storage.from(bucket).list("", { limit: 1, sortBy: { column: "created_at", order: "desc" } });
+        const file = (!error && data && data.length > 0) ? data[0].name : null;
+        return { bucket, label: `Ad ${buckets.indexOf(bucket) + 1}`, file };
+      })
+    );
+    setAdVideos(results);
+    setAdVideosRefreshing(false);
+  }, []);
+
+  useEffect(() => { fetchAdVideos(); }, [fetchAdVideos]);
+
   const addSbToast = useCallback((message, type = "success") => {
     const id = Date.now();
     setSbToasts((prev) => [...prev, { id, message, type }]);
@@ -1670,7 +1694,32 @@ export default function Dashboard() {
 
           {/* ── AD PREVIEWS ── */}
           <div style={{ marginTop: 24 }}>
-            <SectionTitle>Ad Previews</SectionTitle>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+              <SectionTitle>Ad Previews</SectionTitle>
+              <button
+                onClick={fetchAdVideos}
+                disabled={adVideosRefreshing}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  padding: "6px 14px",
+                  borderRadius: 8,
+                  border: "1px solid var(--border)",
+                  background: "var(--bg)",
+                  color: "var(--text)",
+                  fontSize: 13,
+                  fontWeight: 500,
+                  cursor: adVideosRefreshing ? "not-allowed" : "pointer",
+                  opacity: adVideosRefreshing ? 0.6 : 1,
+                  transition: "opacity 0.2s",
+                }}
+              >
+                <span style={{ display: "inline-block", animation: adVideosRefreshing ? "spin 0.8s linear infinite" : "none" }}>↻</span>
+                {adVideosRefreshing ? "Refreshing…" : "Refresh"}
+              </button>
+            </div>
+            <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
             <div
               style={{
                 display: "grid",
@@ -1678,12 +1727,8 @@ export default function Dashboard() {
                 gap: 16,
               }}
             >
-              {[
-                { id: "AD1", label: "Ad 1", file: "data1.mp4" },
-                { id: "AD2", label: "Ad 2", file: "data2.mp4" },
-                { id: "AD3", label: "Ad 3", file: "data3.mp4" },
-              ].map((ad) => (
-                <Card key={ad.id} style={{ padding: 12 }}>
+              {adVideos.map((ad) => (
+                <Card key={ad.bucket} style={{ padding: 12 }}>
                   <div
                     style={{
                       fontSize: 12,
@@ -1707,12 +1752,17 @@ export default function Dashboard() {
                       overflow: "hidden",
                     }}
                   >
-                    <video
-                      src={`https://nidoqmcxmlyiovdktzxg.supabase.co/storage/v1/object/public/${ad.id}/${ad.file}`}
-                      controls
-                      autoPlay={false}
-                      style={{ width: "100%", height: "100%", objectFit: "cover" }}
-                    />
+                    {ad.file ? (
+                      <video
+                        key={ad.file}
+                        src={`https://nidoqmcxmlyiovdktzxg.supabase.co/storage/v1/object/public/${ad.bucket}/${ad.file}`}
+                        controls
+                        autoPlay={false}
+                        style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                      />
+                    ) : (
+                      <span style={{ fontSize: 12, color: "var(--text-muted)" }}>No video yet</span>
+                    )}
                   </div>
                 </Card>
               ))}
