@@ -51,6 +51,9 @@ export default function Dashboard() {
   const [adStatus, setAdStatus] = useState("idle");
   // idle | generating | waiting | done | error
   const [adData,   setAdData]   = useState(null);
+  const [confirmGenStatus, setConfirmGenStatus] = useState("idle");
+  // idle | loading | done | error
+  const [confirmGenError,  setConfirmGenError]  = useState("");
 
   // Approval & launch
   const [approved,     setApproved]     = useState(false);
@@ -341,6 +344,32 @@ export default function Dashboard() {
       setAdStatus("done");
     } else if (adStatus !== "error") {
       setAdStatus("waiting");
+    }
+  }
+
+  // ── Confirm & Generate Ads (direct n8n webhook) ──
+  async function handleConfirmGenerateAds() {
+    setConfirmGenStatus("loading");
+    setConfirmGenError("");
+    try {
+      const res = await fetch("https://n8n.srv881198.hstgr.cloud/webhook/generate_ad", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action:            "generate_ad",
+          topic:             selectedTopic,
+          executive_summary: analysisData?.executive_summary  || "",
+          top_hooks:         analysisData?.hooks_table        || [],
+          competitors:       (analysisData?.competitors_table || []).slice(0, 5),
+          gaps:              analysisData?.gaps_table         || [],
+          timestamp:         new Date().toISOString(),
+        }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setConfirmGenStatus("done");
+    } catch (e) {
+      setConfirmGenStatus("error");
+      setConfirmGenError(e.message || "Could not reach webhook");
     }
   }
 
@@ -1483,6 +1512,52 @@ export default function Dashboard() {
               {adStatus === "error" && (
                 <div style={{ marginTop: 8, fontSize: 12, color: "var(--red-strong)" }}>
                   Could not reach n8n: {webhookError}. Please try again.
+                </div>
+              )}
+
+              {/* ── Confirm & Generate Ads button ── */}
+              <button
+                onClick={handleConfirmGenerateAds}
+                disabled={confirmGenStatus === "loading"}
+                style={{
+                  width: "100%",
+                  marginTop: 10,
+                  padding: "12px 18px",
+                  borderRadius: "var(--radius-md)",
+                  border: "none",
+                  background: confirmGenStatus === "loading"
+                    ? "#ccc"
+                    : "linear-gradient(90deg, #FF6B35 0%, #FF3CAC 100%)",
+                  color: "#fff",
+                  fontSize: 14,
+                  fontWeight: 600,
+                  cursor: confirmGenStatus === "loading" ? "not-allowed" : "pointer",
+                  fontFamily: "inherit",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: 8,
+                  boxShadow: confirmGenStatus === "loading" ? "none" : "0 4px 14px rgba(255,60,172,0.35)",
+                  transition: "opacity 0.2s",
+                  opacity: confirmGenStatus === "loading" ? 0.7 : 1,
+                }}
+              >
+                {confirmGenStatus === "loading" ? (
+                  <><Spinner size={13} color="#fff" /> Triggering...</>
+                ) : confirmGenStatus === "done" ? (
+                  "✓ Ad generation triggered!"
+                ) : (
+                  "Confirm & Generate Ads →"
+                )}
+              </button>
+              {confirmGenStatus === "done" && (
+                <div style={{ marginTop: 6, fontSize: 12, color: "var(--green, #16a34a)" }}>
+                  Webhook triggered. Check the Ad Previews section for new videos.
+                </div>
+              )}
+              {confirmGenStatus === "error" && (
+                <div style={{ marginTop: 6, fontSize: 12, color: "var(--red-strong)" }}>
+                  Error: {confirmGenError}. Please try again.
                 </div>
               )}
             </div>
