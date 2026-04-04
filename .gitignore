@@ -39,3 +39,10 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Claude / IDE local config (machine-specific, not project code)
+.claude/
+
+# Dev utility scripts — contain hardcoded Supabase keys, local use only
+check_buckets.js
+discover_videos.js
